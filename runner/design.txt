@@ -1,0 +1,7 @@
+- boot vm and download+compile flynn components
+- insert flynn docker images
+- set up tap devices
+- boot instances
+- ssh connect
+- run layer 0
+- bootstrap layer 1

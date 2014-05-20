@@ -72,6 +72,7 @@ type Instance interface {
 	Start() error
 	Wait() error
 	Kill() error
+	IP() string
 }
 
 type uml struct {

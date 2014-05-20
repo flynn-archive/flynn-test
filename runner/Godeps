@@ -26,6 +26,10 @@
 			"ImportPath": "github.com/dotcloud/docker/pkg/netlink",
 			"Comment": "v0.11.1-229-g9405a58",
 			"Rev": "9405a58e99636f7d21e1442b90d3b4a9fdcac5bb"
+		},
+		{
+			"ImportPath": "github.com/flynn/go-flynn/attempt",
+			"Rev": "3743ca1e0e1cff877b906dd56983f57699b2cc7d"
 		}
 	]
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -9,6 +10,10 @@ import (
 	"os/exec"
 	"os/user"
 	"strconv"
+	"time"
+
+	"code.google.com/p/go.crypto/ssh"
+	"github.com/flynn/go-flynn/attempt"
 )
 
 func init() {
@@ -28,11 +33,13 @@ func main() {
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(u.Gid)
 
+	fmt.Println("Initializing networking...")
 	if err := initNetworking(); err != nil {
 		log.Fatalf("net init error: %s", err)
 	}
 
-	// create 16GB fs image to store docker data on
+	fmt.Println("Creating docker fs...")
+	// create 16GB sparse fs image to store docker data on
 	dockerRoot, err := createFS(17179869184, uid, gid)
 	if err != nil {
 		log.Fatal(err)
@@ -53,15 +60,22 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	fmt.Println("Booting build instance...")
 	if err := build.Start(); err != nil {
 		log.Fatalf("error starting build instance: %s", err)
 	}
 
-	// download and compile flynn components
+	fmt.Println("Waiting for instance to boot...")
+	if err := buildFlynn(build); err != nil {
+		build.Kill()
+		log.Fatal(err)
+	}
 
-	if err := build.Wait(); err != nil {
+	if err := build.Kill(); err != nil {
 		log.Fatalf("error while stopping build instance: %s", err)
 	}
+
+	os.Exit(0)
 
 	instances := make([]Instance, 5)
 	for i := 0; i < 5; i++ {
@@ -92,6 +106,49 @@ func main() {
 	}
 }
 
+var attempts = attempt.Strategy{
+	Min:   5,
+	Total: 5 * time.Minute,
+	Delay: time.Second,
+}
+
+func buildFlynn(inst Instance) error {
+	buildScript := bytes.NewReader([]byte(`
+#!/bin/bash
+set -e -x
+
+flynn=~/go/src/github.com/flynn
+mkdir -p $flynn
+export GOPATH=~/go
+
+git clone https://github.com/flynn/flynn-devbox
+cd flynn-devbox
+./checkout-flynn manifest.txt $flynn
+./build-flynn $flynn
+
+sudo umount /var/lib/docker
+`[1:]))
+
+	var sc *ssh.Client
+	err := attempts.Run(func() (err error) {
+		fmt.Printf("Attempting to ssh to %s:2222...\n", inst.IP())
+		sc, err = inst.DialSSH()
+		return
+	})
+	if err != nil {
+		return err
+	}
+	defer sc.Close()
+	sess, err := sc.NewSession()
+	sess.Stdin = buildScript
+	sess.Stdout = os.Stdout
+	sess.Stderr = os.Stderr
+	if err := sess.Run("bash"); err != nil {
+		return fmt.Errorf("build error: %s", err)
+	}
+	return nil
+}
+
 func createFS(size int64, uid, gid int) (string, error) {
 	f, err := ioutil.TempFile("", "")
 	if err != nil {
@@ -110,9 +167,9 @@ func createFS(size int64, uid, gid int) (string, error) {
 	f.Chown(uid, gid)
 	f.Close()
 
-	res, err := exec.Command("mkfs.ext4", "-Fq", f.Name()).CombinedOutput()
+	res, err := exec.Command("mkfs.btrfs", f.Name()).CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("mkfs.ext4 error %s - %q", err, res)
+		return "", fmt.Errorf("mkfs.btrfs error %s - %q", err, res)
 	}
 	return f.Name(), nil
 }

@@ -21,7 +21,7 @@ echo ubuntu:ubuntu | chpasswd
 
 # set up fstab
 echo "/dev/ubda / ext4 defaults 0 1" > /etc/fstab
-echo "/dev/ubdb /var/lib/docker ext4 defaults 0 1" >> /etc/fstab
+echo "/dev/ubdb /var/lib/docker btrfs defaults 0 2" >> /etc/fstab
 echo "none /etc/network/interfaces.d hostfs defaults 0 0" >> /etc/fstab
 
 # configure hosts and dns resolution
@@ -68,7 +68,8 @@ EOF
 apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 36A1D7869245C8950F966E92D8576A8BA88D21E9
 echo deb https://get.docker.io/ubuntu docker main > /etc/apt/sources.list.d/docker.list
 apt-get update
-apt-get install -y lxc-docker-0.10.0 aufs-tools
+apt-get install -y lxc-docker-0.10.0 btrfs-tools
+echo 'DOCKER_OPTS="-s btrfs"' >> /etc/default/docker
 
 # install go
 curl -L j.mp/godeb | tar xz

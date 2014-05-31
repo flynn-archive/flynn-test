@@ -18,42 +18,42 @@ import (
 	"code.google.com/p/go.crypto/ssh"
 )
 
-func NewUMLManager() *UMLManager {
-	return &UMLManager{taps: &TapManager{}}
+func NewVMManager() *VMManager {
+	return &VMManager{taps: &TapManager{}}
 }
 
-type UMLManager struct {
+type VMManager struct {
 	taps   *TapManager
 	nextID uint64
 }
 
-type UMLConfig struct {
-	Path   string
+type VMConfig struct {
+	Kernel string
 	User   int
 	Group  int
 	Memory string
-	Drives []UMLDrive
+	Drives map[string]VMDrive
 	Args   []string
 	Out    io.Writer
 
-	hostFS string
+	netFS string
 }
 
-type UMLDrive struct {
+type VMDrive struct {
 	FS  string
 	COW string
 
 	TempCOW bool
 }
 
-func (u *UMLManager) NewInstance(c *UMLConfig) (Instance, error) {
+func (u *VMManager) NewInstance(c *VMConfig) (Instance, error) {
 	id := atomic.AddUint64(&u.nextID, 1) - 1
-	inst := &uml{
-		ID:        fmt.Sprintf("flynn%d", id),
-		UMLConfig: c,
+	inst := &vm{
+		ID:       fmt.Sprintf("flynn%d", id),
+		VMConfig: c,
 	}
-	if c.Path == "" {
-		c.Path = "linux"
+	if c.Kernel == "" {
+		c.Kernel = "vmlinuz"
 	}
 	if c.Out == nil {
 		var err error
@@ -75,24 +75,22 @@ type Instance interface {
 	IP() string
 }
 
-type uml struct {
+type vm struct {
 	ID string
-	*UMLConfig
+	*VMConfig
 	tap *Tap
 	cmd *exec.Cmd
 
 	tempFiles []string
 }
 
-//  linux mem=512M ubd0=uml0.cow1,rootfs.img umid=uml0 con0=fd:0,fd:1 con=pts rw eth0=tuntap,flynntap0 hostfs=`pwd`/net
-
-func (u *uml) writeInterfaceConfig() error {
+func (u *vm) writeInterfaceConfig() error {
 	dir, err := ioutil.TempDir("", "")
 	if err != nil {
 		return err
 	}
 	u.tempFiles = append(u.tempFiles, dir)
-	u.hostFS = dir
+	u.netFS = dir
 
 	if err := os.Chmod(dir, 0755); err != nil {
 		os.RemoveAll(dir)
@@ -109,7 +107,7 @@ func (u *uml) writeInterfaceConfig() error {
 	return u.tap.WriteInterfaceConfig(f)
 }
 
-func (u *uml) cleanup() {
+func (u *vm) cleanup() {
 	for _, f := range u.tempFiles {
 		os.RemoveAll(f)
 	}
@@ -117,39 +115,36 @@ func (u *uml) cleanup() {
 	u.tempFiles = nil
 }
 
-func (u *uml) Start() error {
+func (u *vm) Start() error {
 	u.writeInterfaceConfig()
 	u.Args = append(u.Args,
-		"umid="+u.ID,
-		"con0=fd:0,fd:1",
-		"con=pts",
-		"rw",
-		"eth0=tuntap,"+u.tap.Name,
-		"hostfs="+u.hostFS,
+		"-kernel", u.Kernel,
+		"-append", `"root=/dev/sda"`,
+		"-net", "nic",
+		"-net", "tap,ifname="+u.tap.Name+",script=no,downscript=no",
+		"-virtfs", "fsdriver=local,path="+u.netFS+",security_model=passthrough,readonly,mount_tag=netfs",
+		"-nographic",
 	)
 	if u.Memory != "" {
-		u.Args = append(u.Args, "mem="+u.Memory)
+		u.Args = append(u.Args, "-m", u.Memory)
 	}
 	var err error
 	for i, d := range u.Drives {
+		fs := d.FS
 		if d.TempCOW {
-			d.COW, err = u.tempCOW()
+			fs, err = u.tempCOW(d.FS)
 			if err != nil {
 				u.cleanup()
 				return err
 			}
 		}
-		if d.COW != "" {
-			u.Args = append(u.Args, fmt.Sprintf("ubd%d=%s,%s", i, d.COW, d.FS))
-		} else {
-			u.Args = append(u.Args, fmt.Sprintf("ubd%d=%s", i, d.FS))
-		}
+		u.Args = append(u.Args, fmt.Sprintf("-%s", i), fs)
 	}
 	u.cmd, err = (&execReq{
 		Uid:  u.User,
 		Gid:  u.Group,
-		Path: u.Path,
-		Argv: append([]string{"linux"}, u.Args...),
+		Path: "/usr/bin/qemu-system-x86_64",
+		Argv: append([]string{"/usr/bin/qemu-system-x86_64"}, u.Args...),
 		Env:  []string{"HOME=" + os.Getenv("HOME")},
 	}).start(u.Out)
 	if err != nil {
@@ -158,36 +153,44 @@ func (u *uml) Start() error {
 	return err
 }
 
-func (u *uml) tempCOW() (string, error) {
+func (u *vm) tempCOW(image string) (string, error) {
 	dir, err := ioutil.TempDir("", "")
 	if err != nil {
 		return "", err
 	}
+	u.tempFiles = append(u.tempFiles, dir)
 	if err := os.Chown(dir, u.User, u.Group); err != nil {
 		return "", err
 	}
-	u.tempFiles = append(u.tempFiles, dir)
-	return filepath.Join(dir, "fs.cow1"), nil
+	path := filepath.Join(dir, "fs.img")
+	cmd := exec.Command("qemu-img", "create", "-f", "qcow2", "-b", image, path)
+	if err = cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to create COW filesystem: %s", err.Error())
+	}
+	if err := os.Chown(path, u.User, u.Group); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
-func (u *uml) Wait() error {
+func (u *vm) Wait() error {
 	defer u.cleanup()
 	return u.cmd.Wait()
 }
 
-func (u *uml) Kill() error {
+func (u *vm) Kill() error {
 	defer u.cleanup()
 	return u.cmd.Process.Kill()
 }
 
-func (u *uml) DialSSH() (*ssh.Client, error) {
+func (u *vm) DialSSH() (*ssh.Client, error) {
 	return ssh.Dial("tcp", u.tap.RemoteIP.String()+":2222", &ssh.ClientConfig{
 		User: "ubuntu",
 		Auth: []ssh.AuthMethod{ssh.Password("ubuntu")},
 	})
 }
 
-func (u *uml) IP() string {
+func (u *vm) IP() string {
 	return u.tap.RemoteIP.String()
 }
 

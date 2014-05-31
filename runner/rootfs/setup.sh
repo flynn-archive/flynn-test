@@ -20,9 +20,8 @@ chmod 0440 /etc/sudoers.d/ubuntu
 echo ubuntu:ubuntu | chpasswd
 
 # set up fstab
-echo "/dev/ubda / ext4 defaults 0 1" > /etc/fstab
-echo "/dev/ubdb /var/lib/docker ext4 defaults 0 1" >> /etc/fstab
-echo "none /etc/network/interfaces.d hostfs defaults 0 0" >> /etc/fstab
+echo "LABEL=rootfs / ext4 defaults 0 1" > /etc/fstab
+echo "netfs /etc/network/interfaces.d 9p trans=virtio 0 0" >> /etc/fstab
 
 # configure hosts and dns resolution
 echo "127.0.0.1 localhost localhost.localdomain" > /etc/hosts
@@ -49,6 +48,7 @@ echo 'Acquire::Languages "none";' > /etc/apt/apt.conf.d/no-languages
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get dist-upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold'
+apt-get install linux-generic-lts-trusty -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold'
 
 # install ssh server and go deps
 apt-get install -y apt-transport-https openssh-server mercurial git make curl

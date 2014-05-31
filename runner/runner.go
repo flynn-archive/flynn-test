@@ -22,9 +22,9 @@ func init() {
 
 func main() {
 	maybeExec()
-	username := flag.String("user", "ubuntu", "user to run UML as")
-	rootfs := flag.String("rootfs", "rootfs.img", "fs image to use with UML")
-	linux := flag.String("linux", "linux", "path to the UML binary")
+	username := flag.String("user", "ubuntu", "user to run QEMU as")
+	rootfs := flag.String("rootfs", "rootfs.img", "fs image to use with QEMU")
+	kernel := flag.String("kernel", "vmlinuz", "path to the Linux binary")
 	flag.Parse()
 	u, err := user.Lookup(*username)
 	if err != nil {
@@ -45,16 +45,16 @@ func main() {
 		log.Fatal(err)
 	}
 
-	um := NewUMLManager()
+	vm := NewVMManager()
 
-	build, err := um.NewInstance(&UMLConfig{
-		Path:   *linux,
+	build, err := vm.NewInstance(&VMConfig{
+		Kernel: *kernel,
 		User:   uid,
 		Group:  gid,
-		Memory: "512MB",
-		Drives: []UMLDrive{
-			{FS: *rootfs, TempCOW: true},
-			{FS: dockerRoot},
+		Memory: "512",
+		Drives: map[string]VMDrive{
+			"hda": VMDrive{FS: *rootfs, TempCOW: true},
+			"hdb": VMDrive{FS: dockerRoot},
 		},
 	})
 	if err != nil {
@@ -79,14 +79,13 @@ func main() {
 
 	instances := make([]Instance, 5)
 	for i := 0; i < 5; i++ {
-		inst, err := um.NewInstance(&UMLConfig{
-			Path:   *linux,
+		inst, err := vm.NewInstance(&VMConfig{
 			User:   uid,
 			Group:  gid,
 			Memory: "512MB",
-			Drives: []UMLDrive{
-				{FS: *rootfs, TempCOW: true},
-				{FS: dockerRoot, TempCOW: true},
+			Drives: map[string]VMDrive{
+				"hda": VMDrive{FS: *rootfs, TempCOW: true},
+				"hdb": VMDrive{FS: dockerRoot, TempCOW: true},
 			},
 		})
 		if err != nil {

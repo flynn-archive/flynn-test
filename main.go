@@ -5,12 +5,14 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -21,9 +23,9 @@ import (
 	"gopkg.in/check.v1"
 )
 
+var listen = flag.Bool("listen", false, "listen for repository events")
 var username = flag.String("user", "ubuntu", "user to run QEMU as")
 var rootfs = flag.String("rootfs", "rootfs/rootfs.img", "fs image to use with QEMU")
-var dockerfs = flag.String("dockerfs", "", "docker fs")
 var kernel = flag.String("kernel", "rootfs/vmlinuz", "path to the Linux binary")
 var flagCLI = flag.String("cli", "flynn", "path to flynn-cli binary")
 var debug = flag.Bool("debug", false, "enable debug output")
@@ -37,25 +39,72 @@ ssh -o LogLevel=FATAL -o IdentitiesOnly=yes -o UserKnownHostsFile=/dev/null -o S
 `[1:]))
 
 var gitEnv []string
+var dockerfs string
 var flynnrc string
+var bootConfig cluster.BootConfig
+var events chan Event
+var githubToken string
+
+var repos = map[string]string{
+	"flynn-host":       "master",
+	"docker-etcd":      "master",
+	"discoverd":        "master",
+	"flynn-bootstrap":  "master",
+	"flynn-controller": "master",
+	"flynn-postgres":   "master",
+	"flynn-receive":    "master",
+	"shelf":            "master",
+	"strowger":         "master",
+	"slugbuilder":      "master",
+	"slugrunner":       "master",
+}
 
 func init() {
+	flag.StringVar(&dockerfs, "dockerfs", "", "docker fs")
 	flag.StringVar(&flynnrc, "flynnrc", "", "path to flynnrc file")
 	flag.Parse()
 	log.SetFlags(log.Lshortfile)
 }
 
 func main() {
+	bootConfig = cluster.BootConfig{
+		User:     *username,
+		RootFS:   *rootfs,
+		Kernel:   *kernel,
+		NatIface: *natIface,
+	}
+
+	if *listen == true {
+		githubToken = os.Getenv("GITHUB_TOKEN")
+		if githubToken == "" {
+			log.Fatal("GITHUB_TOKEN not set")
+		}
+		if dockerfs == "" {
+			var err error
+			if dockerfs, err = cluster.BuildFlynn(bootConfig, "", repos); err != nil {
+				log.Fatal("could not build flynn:", err)
+			}
+		}
+		events = make(chan Event, 10)
+		go handleEvents(dockerfs)
+
+		http.HandleFunc("/", webhookHandler)
+		fmt.Println("Listening on :80...")
+		if err := http.ListenAndServe(":80", nil); err != nil {
+			log.Fatal("ListenAndServer: ", err)
+		}
+	}
+
 	if flynnrc == "" {
-		c := cluster.New(cluster.BootConfig{
-			User:     *username,
-			RootFS:   *rootfs,
-			DockerFS: *dockerfs,
-			Kernel:   *kernel,
-			NatIface: *natIface,
-		})
-		if err := c.Boot(1); err != nil {
-			log.Fatal(err)
+		c := cluster.New(bootConfig)
+		if dockerfs == "" {
+			var err error
+			if dockerfs, err = c.BuildFlynn("", repos); err != nil {
+				log.Fatal("could not build flynn:", err)
+			}
+		}
+		if err := c.Boot(dockerfs, 1); err != nil {
+			log.Fatal("could not boot cluster: ", err)
 		}
 		if *killCluster {
 			defer c.Shutdown()
@@ -85,6 +134,157 @@ func main() {
 		KeepWorkDir: *debug,
 	})
 	fmt.Println(res)
+}
+
+func webhookHandler(w http.ResponseWriter, r *http.Request) {
+	header, ok := r.Header["X-Github-Event"]
+	if !ok {
+		log.Println("webhook: request missing X-Github-Event header")
+		http.Error(w, "missing X-Github-Event header\n", 400)
+		return
+	}
+
+	name := strings.Join(header, " ")
+	var event Event
+	switch name {
+	case "push":
+		event = &PushEvent{}
+	case "pull_request":
+		event = &PullRequestEvent{}
+	default:
+		log.Println("webhook: unknown X-Github-Event:", name)
+		http.Error(w, fmt.Sprintf("Unknown X-Github-Event: %s\n", name), 400)
+		return
+	}
+
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&event); err != nil && err != io.EOF {
+		log.Println("webhook: error decoding JSON", err)
+		http.Error(w, fmt.Sprintf("invalid JSON payload for %s event", name), 400)
+		return
+	}
+	repo := event.Repo()
+	if _, ok := repos[repo]; !ok {
+		log.Println("webhook: unknown repo", repo)
+		http.Error(w, fmt.Sprintf("unknown repo %s", repo), 400)
+		return
+	}
+	logEvent(event)
+	events <- event
+	io.WriteString(w, "ok\n")
+}
+
+func handleEvents(dockerfs string) {
+	for event := range events {
+		if !needsBuild(event) {
+			continue
+		}
+		updateStatus(event, "pending")
+		log.Printf("building %s[%s]\n", event.Repo(), event.Commit())
+		repos := map[string]string{event.Repo(): event.Commit()}
+		newDockerfs, err := cluster.BuildFlynn(bootConfig, dockerfs, repos)
+		if err != nil {
+			updateStatus(event, "failure")
+			fmt.Printf("could not build flynn: %s\n", err)
+			continue
+		}
+
+		cmd := exec.Command(
+			os.Args[0],
+			"--user", *username,
+			"--rootfs", *rootfs,
+			"--dockerfs", newDockerfs,
+			"--kernel", *kernel,
+			"--cli", *flagCLI,
+			"--nat", *natIface,
+			"--kill", "false",
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			updateStatus(event, "failure")
+			fmt.Printf("build failed: %s\n", err)
+			continue
+		}
+		updateStatus(event, "success")
+		fmt.Printf("build passed!\n")
+	}
+}
+
+func logEvent(event Event) {
+	switch event.(type) {
+	case *PushEvent:
+		e := event.(*PushEvent)
+		log.Printf(
+			"received push of %s[%s] by %s: %s => %s\n",
+			e.Repo(),
+			e.Ref,
+			e.Pusher.Name,
+			e.Before,
+			e.After,
+		)
+	case *PullRequestEvent:
+		e := event.(*PullRequestEvent)
+		log.Printf(
+			"pull request %s/%d %s by %s\n",
+			e.Repo(),
+			e.Number,
+			e.Action,
+			e.Sender.Login,
+		)
+	}
+}
+
+func needsBuild(event Event) bool {
+	if e, ok := event.(*PullRequestEvent); ok && e.Action == "closed" {
+		return false
+	}
+	return true
+}
+
+type Status struct {
+	State       string `json:"state"`
+	TargetUrl   string `json:"target_url,omitempty"`
+	Description string `json:"description,omitempty"`
+	Context     string `json:"context,omitempty"`
+}
+
+var descriptions = map[string]string{
+	"pending": "The Flynn CI build is in progress",
+	"success": "The Flynn CI build passed",
+	"failure": "The Flynn CI build failed",
+}
+
+func updateStatus(event Event, state string) {
+	go func() {
+		log.Printf("updateStatus: %s %s[%s]\n", state, event.Repo(), event.Commit())
+
+		url := fmt.Sprintf("https://api.github.com/repos/flynn/%s/statuses/%s", event.Repo(), event.Commit())
+		status := Status{State: state, Description: descriptions[state], Context: "flynn"}
+		body := bytes.NewBufferString("")
+		if err := json.NewEncoder(body).Encode(status); err != nil {
+			log.Printf("updateStatus: could not encode status: %+v\n", status)
+			return
+		}
+
+		req, err := http.NewRequest("POST", url, body)
+		if err != nil {
+			log.Printf("updateStatus: could not create request: %s\n", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", fmt.Sprintf("token %s", githubToken))
+
+		res, err := http.DefaultClient.Do(req)
+		defer res.Body.Close()
+		if err != nil {
+			log.Printf("updateStatus: could not send request: %s\n", err)
+			return
+		}
+		if res.StatusCode != 201 {
+			log.Printf("updateStatus: request failed: %d\n", res.StatusCode)
+		}
+	}()
 }
 
 type sshData struct {
